@@ -7,8 +7,8 @@ from datetime import datetime
 from fastapi import FastAPI, Query, Response
 
 from . import db
-from .schemas import PublishCommand, RevokeCommand
-from .service import handle_publish, handle_revoke, query_broadcast
+from .schemas import AmendCommand, PublishCommand, RevokeCommand
+from .service import handle_amend, handle_publish, handle_revoke, query_broadcast
 
 
 @asynccontextmanager
@@ -21,7 +21,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="园区应急广播播发裁决服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -33,6 +33,7 @@ def index():
         "docs": "/docs",
         "endpoints": [
             "POST /api/commands/publish",
+            "POST /api/commands/amend",
             "POST /api/commands/revoke",
             "GET  /api/broadcast?at=<ISO8601>&area=<区域>",
             "GET  /healthz",
@@ -57,6 +58,14 @@ def publish(cmd: PublishCommand, response: Response):
 def revoke(cmd: RevokeCommand, response: Response):
     """提交撤销命令。首次受理 201，同请求号同载荷重放 200 并返回首次回执。"""
     receipt, status = handle_revoke(cmd)
+    response.status_code = status
+    return receipt
+
+
+@app.post("/api/commands/amend", status_code=201)
+def amend(cmd: AmendCommand, response: Response):
+    """提交修订命令：整体替换进行中告警的文案/级别/区域。首次 201，同载荷重放 200。"""
+    receipt, status = handle_amend(cmd)
     response.status_code = status
     return receipt
 

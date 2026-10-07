@@ -7,8 +7,8 @@ from datetime import datetime
 from fastapi import FastAPI, Query, Response
 
 from . import db
-from .schemas import PublishCommand, RevokeCommand
-from .service import handle_publish, handle_revoke, query_broadcast
+from .schemas import PublishCommand, ReviseCommand, RevokeCommand
+from .service import handle_publish, handle_revise, handle_revoke, query_broadcast
 
 
 @asynccontextmanager
@@ -21,7 +21,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="园区应急广播播发裁决服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -33,6 +33,7 @@ def index():
         "docs": "/docs",
         "endpoints": [
             "POST /api/commands/publish",
+            "POST /api/commands/revise",
             "POST /api/commands/revoke",
             "GET  /api/broadcast?at=<ISO8601>&area=<区域>",
             "GET  /healthz",
@@ -57,6 +58,18 @@ def publish(cmd: PublishCommand, response: Response):
 def revoke(cmd: RevokeCommand, response: Response):
     """提交撤销命令。首次受理 201，同请求号同载荷重放 200 并返回首次回执。"""
     receipt, status = handle_revoke(cmd)
+    response.status_code = status
+    return receipt
+
+
+@app.post("/api/commands/revise", status_code=201)
+def revise(cmd: ReviseCommand, response: Response):
+    """提交修订命令：整体替换进行中告警的文案/级别/区域。
+
+    首次受理 201，同请求号同载荷重放 200 并返回首次回执；
+    告警不存在 404，未生效/已到期/已撤销 409，入参非法 422。
+    """
+    receipt, status = handle_revise(cmd)
     response.status_code = status
     return receipt
 

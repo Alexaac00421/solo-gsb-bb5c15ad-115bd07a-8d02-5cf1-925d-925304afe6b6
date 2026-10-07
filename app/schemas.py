@@ -4,18 +4,12 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-class PublishCommand(BaseModel):
-    """发布命令：值守员提交一条新告警。"""
+class _CommandBase(BaseModel):
+    """命令公共字段：request_no 为幂等键。"""
 
     model_config = ConfigDict(extra="forbid")
 
     request_no: str = Field(min_length=1, max_length=128, description="请求号，幂等键")
-    alert_no: int = Field(gt=0, description="告警号，正整数，全局不可复用")
-    areas: list[str] = Field(min_length=1, description="覆盖区域列表，非空且互不重复")
-    level: int = Field(ge=1, le=5, description="告警级别 1~5，5 最高")
-    message: str = Field(min_length=1, max_length=2000, description="播发文案，非空")
-    delay_seconds: int = Field(ge=0, description="延迟秒数，相对受理时间")
-    duration_seconds: int = Field(gt=0, description="持续秒数，正整数")
 
     @field_validator("request_no")
     @classmethod
@@ -23,6 +17,14 @@ class PublishCommand(BaseModel):
         if not v.strip():
             raise ValueError("request_no 不能为空或全为空白字符")
         return v
+
+
+class _ContentMixin(BaseModel):
+    """文案 / 级别 / 区域的发布期校验，发布与修订共用同一套规则。"""
+
+    areas: list[str] = Field(min_length=1, description="覆盖区域列表，非空且互不重复")
+    level: int = Field(ge=1, le=5, description="告警级别 1~5，5 最高")
+    message: str = Field(min_length=1, max_length=2000, description="播发文案，非空")
 
     @field_validator("areas")
     @classmethod
@@ -41,17 +43,25 @@ class PublishCommand(BaseModel):
         return v
 
 
-class RevokeCommand(BaseModel):
+class PublishCommand(_CommandBase, _ContentMixin):
+    """发布命令：值守员提交一条新告警。"""
+
+    alert_no: int = Field(gt=0, description="告警号，正整数，全局不可复用")
+    delay_seconds: int = Field(ge=0, description="延迟秒数，相对受理时间")
+    duration_seconds: int = Field(gt=0, description="持续秒数，正整数")
+
+
+class RevokeCommand(_CommandBase):
     """撤销命令：按受理时间终止既有告警的后续播发。"""
 
-    model_config = ConfigDict(extra="forbid")
-
-    request_no: str = Field(min_length=1, max_length=128, description="请求号，幂等键")
     alert_no: int = Field(gt=0, description="待撤销的告警号")
 
-    @field_validator("request_no")
-    @classmethod
-    def request_no_non_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("request_no 不能为空或全为空白字符")
-        return v
+
+class ReviseCommand(_CommandBase, _ContentMixin):
+    """修订命令：对进行中告警的文案、级别、覆盖区域做整体替换。
+
+    不含 delay/duration：修订不改变原生效终点；仅输入告警号与完整的新文案、
+    级别、区域列表。校验规则（非空、去重、级别区间）与发布一致。
+    """
+
+    alert_no: int = Field(gt=0, description="待修订的告警号")

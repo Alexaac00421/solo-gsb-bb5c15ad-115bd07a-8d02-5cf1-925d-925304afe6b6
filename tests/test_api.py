@@ -8,6 +8,8 @@ import itertools
 import json
 import os
 import random
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -62,6 +64,18 @@ def publish_payload(**over):
 
 def do_publish(client, **over):
     return client.post("/api/commands/publish", json=publish_payload(**over))
+
+
+def do_revise(client, alert_no, **over):
+    p = {
+        "request_no": rid(),
+        "alert_no": alert_no,
+        "areas": [area()],
+        "level": 3,
+        "message": "修订后文案：请沿北侧通道撤离",
+    }
+    p.update(over)
+    return client.post("/api/commands/revise", json=p)
 
 
 # ---------------------------------------------------------------- 基础受理
@@ -322,3 +336,370 @@ def test_revoke_releases_area_to_lower_priority(client):
     # 高级别被撤销后，低级别立即恢复
     assert client.get("/api/broadcast", params={"area": a}).json()["results"][0]["alert_no"] \
         == low["alert_no"]
+
+
+# ---------------------------------------------------------------- 修订
+
+def test_revise_receipt_and_replaces_broadcast(client):
+    a1, a2 = area(), area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a1, a2], level=2, message="原始文案", duration_seconds=3600)).json()
+
+    new_areas = [a1, area()]
+    r = do_revise(client, pub["alert_no"], areas=new_areas, level=4, message="修订文案")
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["command_type"] == "revise"
+    assert body["status"] == "accepted"
+    assert body["alert_no"] == pub["alert_no"]
+    assert body["level"] == 4
+    assert body["message"] == "修订文案"
+    assert body["areas"] == new_areas
+    # 回执含受理时刻；生效区间沿用原发布区间（终点不变）
+    assert body["revised_at"] == body["accepted_at"]
+    assert body["effective_from"] == pub["effective_from"]
+    assert body["effective_to"] == pub["effective_to"]
+
+    # 新区域立即播新版本
+    res = client.get("/api/broadcast", params={"area": new_areas[1]}).json()["results"]
+    assert len(res) == 1
+    assert res[0]["alert_no"] == pub["alert_no"]
+    assert res[0]["level"] == 4
+    assert res[0]["message"] == "修订文案"
+    # 保留区域 a1 同样播新版本
+    res_a1 = client.get("/api/broadcast", params={"area": a1}).json()["results"]
+    assert res_a1[0]["message"] == "修订文案"
+    # 被移出覆盖列表的区域不再播发
+    assert client.get("/api/broadcast", params={"area": a2}).json()["results"] == []
+
+
+def test_revise_keeps_pre_revision_history(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="原始文案", duration_seconds=3600)).json()
+    rv = do_revise(client, pub["alert_no"], areas=[a], level=5, message="修订文案")
+    assert rv.status_code == 201
+
+    # 修订受理时刻之前（发布起点）→ 仍是旧版本
+    hist = client.get("/api/broadcast",
+                      params={"area": a, "at": pub["effective_from"]}).json()["results"]
+    assert hist[0]["level"] == 2
+    assert hist[0]["message"] == "原始文案"
+    # 修订受理时刻（含）起 → 新版本
+    at_rev = client.get("/api/broadcast",
+                        params={"area": a, "at": rv.json()["accepted_at"]}).json()["results"]
+    assert at_rev[0]["level"] == 5
+    assert at_rev[0]["message"] == "修订文案"
+
+
+def test_revise_change_areas_keeps_old_area_history(client):
+    a_old, a_new = area(), area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a_old], level=3, message="旧", duration_seconds=3600)).json()
+    rv = do_revise(client, pub["alert_no"], areas=[a_new], level=3, message="新")
+    assert rv.status_code == 201
+    # 历史时刻：旧区域可查，新区域不存在该告警
+    old_hist = client.get("/api/broadcast",
+                          params={"area": a_old, "at": pub["effective_from"]}).json()["results"]
+    assert old_hist[0]["alert_no"] == pub["alert_no"]
+    new_hist = client.get("/api/broadcast",
+                          params={"area": a_new, "at": pub["effective_from"]}).json()["results"]
+    assert new_hist == []
+    # 当前时刻：新区域可查，旧区域已停播
+    assert client.get("/api/broadcast",
+                      params={"area": a_new}).json()["results"][0]["message"] == "新"
+    assert client.get("/api/broadcast", params={"area": a_old}).json()["results"] == []
+
+
+def test_revise_priority_uses_level_at_moment(client):
+    a = area()
+    high = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=5, message="高级别", duration_seconds=3600)).json()
+    mid = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=3, message="中级别", duration_seconds=3600)).json()
+    assert client.get("/api/broadcast", params={"area": a}).json()["results"][0]["alert_no"] \
+        == high["alert_no"]
+    # 高级别告警被修订到最低级 → 中级别告警接管（级别取修订后当时版本）
+    rv = do_revise(client, high["alert_no"], areas=[a], level=1, message="降级为1级")
+    assert rv.status_code == 201
+    res = client.get("/api/broadcast", params={"area": a}).json()["results"]
+    assert res[0]["alert_no"] == mid["alert_no"]
+    assert res[0]["level"] == 3
+    # 历史时刻（修订前）仍是原高级别
+    hist = client.get("/api/broadcast",
+                      params={"area": a, "at": high["effective_from"]}).json()["results"]
+    assert hist[0]["alert_no"] == high["alert_no"]
+    assert hist[0]["level"] == 5
+
+
+def test_revise_chain_versions(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=3, message="v0", duration_seconds=3600)).json()
+    r1 = do_revise(client, pub["alert_no"], areas=[a], level=3, message="v1")
+    assert r1.status_code == 201
+    r2 = do_revise(client, pub["alert_no"], areas=[a], level=3, message="v2")
+    assert r2.status_code == 201
+
+    def msg_at(ts):
+        return client.get("/api/broadcast",
+                          params={"area": a, "at": ts}).json()["results"][0]["message"]
+
+    assert msg_at(pub["effective_from"]) == "v0"
+    assert msg_at(r1.json()["accepted_at"]) == "v1"
+    assert msg_at(r2.json()["accepted_at"]) == "v2"
+    assert client.get("/api/broadcast", params={"area": a}).json()["results"][0]["message"] == "v2"
+
+
+def test_revise_does_not_extend_end(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], duration_seconds=2)).json()
+    rv = do_revise(client, pub["alert_no"], areas=[a])
+    assert rv.status_code == 201
+    assert rv.json()["effective_to"] == pub["effective_to"]
+    # 原终点之后（修订不延长）→ 停播（限定本告警区域，避免读到其他用例的告警）
+    after = parse(pub["effective_to"]) + timedelta(seconds=1)
+    assert client.get("/api/broadcast",
+                      params={"area": a, "at": iso(after)}).json()["results"] == []
+
+
+def test_revise_unknown_alert_404(client):
+    r = do_revise(client, next_alert_no())
+    assert r.status_code == 404
+
+
+def test_revise_not_yet_effective_409(client):
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        delay_seconds=3600, duration_seconds=60)).json()
+    r = do_revise(client, pub["alert_no"])
+    assert r.status_code == 409
+
+
+def test_revise_expired_409(client):
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        duration_seconds=1)).json()
+    time.sleep(1.2)
+    r = do_revise(client, pub["alert_no"])
+    assert r.status_code == 409
+
+
+def test_revise_after_revoke_409(client):
+    pub = do_publish(client).json()
+    assert client.post("/api/commands/revoke",
+                       json={"request_no": rid(), "alert_no": pub["alert_no"]}).status_code == 201
+    r = do_revise(client, pub["alert_no"])
+    assert r.status_code == 409
+
+
+def test_revoke_after_revise_keeps_revision_history(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="旧文案", duration_seconds=3600)).json()
+    rv = client.post("/api/commands/revise", json={
+        "request_no": rid(), "alert_no": pub["alert_no"],
+        "areas": [a], "level": 2, "message": "修订文案",
+    })
+    assert rv.status_code == 201
+    revised_at = parse(rv.json()["accepted_at"])
+    xk = client.post("/api/commands/revoke",
+                     json={"request_no": rid(), "alert_no": pub["alert_no"]})
+    assert xk.status_code == 201
+    revoked_at = parse(xk.json()["revoked_at"])
+
+    # 撤销后停播
+    assert client.get("/api/broadcast", params={"area": a}).json()["results"] == []
+    # 修订期间（修订受理时刻与撤销时刻之间）→ 保留修订版本历史
+    midpoint = revised_at + (revoked_at - revised_at) / 2
+    mid = client.get("/api/broadcast",
+                     params={"area": a, "at": iso(midpoint)}).json()["results"]
+    assert mid[0]["message"] == "修订文案"
+    # 修订前 → 旧文案
+    hist = client.get("/api/broadcast",
+                      params={"area": a, "at": pub["effective_from"]}).json()["results"]
+    assert hist[0]["message"] == "旧文案"
+    # 撤销时刻（不含）起停播
+    assert client.get("/api/broadcast",
+                      params={"area": a, "at": xk.json()["revoked_at"]}).json()["results"] == []
+
+
+def test_revise_idempotent_replay(client):
+    pub = do_publish(client).json()
+    payload = {"request_no": rid(), "alert_no": pub["alert_no"],
+               "areas": [area()], "level": 4, "message": "修订文案"}
+    r1 = client.post("/api/commands/revise", json=payload)
+    assert r1.status_code == 201
+    r2 = client.post("/api/commands/revise", json=payload)
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
+
+
+def test_revise_same_request_no_different_payload_409(client):
+    pub = do_publish(client).json()
+    payload = {"request_no": rid(), "alert_no": pub["alert_no"],
+               "areas": [area()], "level": 4, "message": "修订文案"}
+    assert client.post("/api/commands/revise", json=payload).status_code == 201
+    conflict = dict(payload, message="另一份修订")
+    assert client.post("/api/commands/revise", json=conflict).status_code == 409
+
+
+def test_revise_request_no_conflict_with_publish(client):
+    p = publish_payload()
+    assert client.post("/api/commands/publish", json=p).status_code == 201
+    r = client.post("/api/commands/revise", json={
+        "request_no": p["request_no"], "alert_no": p["alert_no"],
+        "areas": [area()], "level": 1, "message": "x"})
+    assert r.status_code == 409
+
+
+@pytest.mark.parametrize("override", [
+    {"areas": []},
+    {"areas": ["A", "A"]},
+    {"areas": ["  "]},
+    {"message": ""},
+    {"message": "   "},
+    {"level": 0},
+    {"level": 6},
+    {"alert_no": 0},
+    {"alert_no": -1},
+    {"request_no": ""},
+    {"unknown_field": 1},
+])
+def test_invalid_revise_rejected(client, override):
+    pub = do_publish(client).json()
+    payload = {
+        "request_no": rid(),
+        "alert_no": pub["alert_no"],
+        "areas": [area()],
+        "level": 3,
+        "message": "修订后文案：请沿北侧通道撤离",
+    }
+    payload.update(override)
+    r = client.post("/api/commands/revise", json=payload)
+    assert r.status_code == 422, (override, r.text)
+
+
+def test_failed_revise_leaves_no_state(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="原始", duration_seconds=3600)).json()
+    # 422：空文案
+    bad = {"request_no": rid(), "alert_no": pub["alert_no"],
+           "areas": [a], "level": 3, "message": ""}
+    assert client.post("/api/commands/revise", json=bad).status_code == 422
+    # 404：不存在的告警
+    missing = {"request_no": rid(), "alert_no": next_alert_no(),
+               "areas": [a], "level": 3, "message": "x"}
+    assert client.post("/api/commands/revise", json=missing).status_code == 404
+    # 当前播发仍是原始版本，失败修订未留任何版本痕迹
+    res = client.get("/api/broadcast", params={"area": a}).json()["results"]
+    assert res[0]["message"] == "原始"
+    assert res[0]["level"] == 2
+    # 失败命令不占用请求号：同一请求号换新载荷可正常受理
+    retry = dict(missing, alert_no=pub["alert_no"], message="后来成功")
+    assert client.post("/api/commands/revise", json=retry).status_code == 201
+    assert client.get("/api/broadcast",
+                      params={"area": a}).json()["results"][0]["message"] == "后来成功"
+
+
+def test_concurrent_identical_revise_single_accept(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], duration_seconds=3600)).json()
+    payload = {"request_no": rid(), "alert_no": pub["alert_no"],
+               "areas": [a], "level": 4, "message": "并发同载荷修订"}
+
+    def send():
+        return client.post("/api/commands/revise", json=payload)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rs = list(ex.map(lambda _: send(), range(8)))
+    codes = sorted(r.status_code for r in rs)
+    assert codes.count(201) == 1, codes
+    assert codes.count(200) == 7, codes
+
+
+def test_concurrent_revoke_and_revise_mutually_exclusive(client):
+    """并发下撤销与修订在行锁上串行化：二者绝不“都成功”。
+
+    无论哪个先拿到锁：
+    - 撤销先提交 → 修订 409，告警终止；
+    - 修订先提交 → 撤销 201，修订期间历史保留。
+    """
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="旧", duration_seconds=3600)).json()
+    barrier = threading.Barrier(2)
+
+    def do_revoke():
+        barrier.wait()
+        return client.post("/api/commands/revoke",
+                           json={"request_no": rid(), "alert_no": pub["alert_no"]})
+
+    def do_revise():
+        barrier.wait()
+        return client.post("/api/commands/revise", json={
+            "request_no": rid(), "alert_no": pub["alert_no"],
+            "areas": [a], "level": 2, "message": "修订版本"})
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [ex.submit(do_revoke), ex.submit(do_revise)]
+        r_revoke, r_revise = [f.result() for f in futs]
+
+    assert r_revoke.status_code == 201
+    assert r_revise.status_code in (201, 409)
+    if r_revise.status_code == 409:
+        # 撤销先成功：修订失败，当前停播
+        assert client.get("/api/broadcast", params={"area": a}).json()["results"] == []
+    else:
+        # 修订先成功后撤销：修订期间历史保留，撤销后停播
+        revised_at = parse(r_revise.json()["accepted_at"])
+        revoked_at = parse(r_revoke.json()["revoked_at"])
+        assert revised_at <= revoked_at
+        mid = revised_at + (revoked_at - revised_at) / 2
+        res = client.get("/api/broadcast",
+                         params={"area": a, "at": iso(mid)}).json()["results"]
+        assert res[0]["message"] == "修订版本"
+        assert client.get("/api/broadcast", params={"area": a}).json()["results"] == []
+
+
+def test_revoke_first_then_revise_deterministic(client):
+    """确定性构造“撤销先成功”：串行先撤销、再修订 → 修订必须 409。"""
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="旧", duration_seconds=3600)).json()
+    assert client.post("/api/commands/revoke",
+                       json={"request_no": rid(), "alert_no": pub["alert_no"]}).status_code == 201
+    r = do_revise(client, pub["alert_no"], areas=[a], message="不应生效")
+    assert r.status_code == 409
+    assert client.get("/api/broadcast", params={"area": a}).json()["results"] == []
+
+
+def test_concurrent_revise_first_then_revoke(client):
+    a = area()
+    pub = client.post("/api/commands/publish", json=publish_payload(
+        areas=[a], level=2, message="旧", duration_seconds=3600)).json()
+    barrier = threading.Barrier(2)
+
+    def revise_first():
+        barrier.wait()
+        return do_revise(client, pub["alert_no"], areas=[a], level=2, message="修订版本")
+
+    def revoke_after():
+        barrier.wait()
+        time.sleep(0.05)  # 让修订先拿到行锁并提交
+        return client.post("/api/commands/revoke",
+                           json={"request_no": rid(), "alert_no": pub["alert_no"]})
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [ex.submit(revise_first), ex.submit(revoke_after)]
+        r_revise, r_revoke = [f.result() for f in futs]
+    assert r_revise.status_code == 201
+    assert r_revoke.status_code == 201
+    revised_at = parse(r_revise.json()["accepted_at"])
+    revoked_at = parse(r_revoke.json()["revoked_at"])
+    # 修订期间历史保留
+    mid = revised_at + (revoked_at - revised_at) / 2
+    res = client.get("/api/broadcast",
+                     params={"area": a, "at": iso(mid)}).json()["results"]
+    assert res[0]["message"] == "修订版本"
